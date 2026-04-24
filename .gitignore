@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Audio / test files (don't commit)
+*.wav
+*.ogg
+*.pdf
+*.mp3
+*.flac
+
+# Test/dev files
+test*.py
+test*.json
+call_*.py
+ocr_input_*.json
+test_ocr_local.py
+test_mcp.py
+
+# Modal / ML
+*.safetensors
+.cache/
+.huggingface/
+modal_cache/
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
