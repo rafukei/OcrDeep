@@ -4,12 +4,20 @@ Runs entirely on Modal GPU — no external API calls.
 
 Model is cached at module level (one load per container) and reused for all pages.
 """
-import base64, re
+import base64
+import logging
+import os
+import re
+import tempfile
+import traceback
 from io import BytesIO
-import tempfile, os
 
 import modal
 from modal import App, Image as ModalImage, fastapi_endpoint
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = App("modal-ocr-mcp")
 MODEL_NAME = "deepseek-ai/DeepSeek-OCR-2"
@@ -34,7 +42,7 @@ modal_image = (
         "torchvision>=0.15.0",
         "fastapi[standard]>=0.110.0",
     )
-    .env({"FORCE_REBUILD": "17"})
+    .env({"FORCE_REBUILD": "18"})
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +57,8 @@ def _get_model():
     global _cached_model, _cached_tokenizer
     if _cached_model is None:
         from transformers import AutoModel, AutoTokenizer
-        print(f"Loading model {MODEL_NAME}...")
+
+        logger.info(f"Loading model %s...", MODEL_NAME)
         _cached_tokenizer = AutoTokenizer.from_pretrained(
             MODEL_NAME, trust_remote_code=True
         )
@@ -59,7 +68,7 @@ def _get_model():
             use_safetensors=True,
         )
         _cached_model = _cached_model.eval().cuda()
-        print("Model loaded on GPU.")
+        logger.info("Model loaded on GPU.")
     return _cached_model, _cached_tokenizer
 
 
@@ -78,6 +87,7 @@ def pdf_bytes_to_images(pdf_bytes: bytes) -> list[bytes]:
         List of PNG image bytes, one per page.
     """
     from pdf2image import convert_from_bytes
+
     images = convert_from_bytes(pdf_bytes, fmt="png", dpi=150)
     result = []
     for img in images:
@@ -91,6 +101,11 @@ def strip_ocr_markers(text: str) -> str:
     """
     Remove DeepSeek-OCR-2 output markers from text.
 
+    Removes:
+        - Block-level markers: <|ref|>...</|ref|> and <|det|>...</|det|>
+        - Per-line bbox markers: `text[[x,y,w,h]]`, `title[[...]]`, etc.
+          Replaces them with empty string (does not remove entire line).
+
     Args:
         text: Raw model output string.
 
@@ -100,8 +115,15 @@ def strip_ocr_markers(text: str) -> str:
     # Remove block-level markers (ref/det spans)
     text = re.sub(r'<\|ref\|>(.*?)<\|/ref\|>', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'<\|det\|>(.*?)<\|/det\|>', r'\1', text, flags=re.DOTALL)
+
     # Remove per-line bbox markers: text[[x,y,w,h]], title[[...]], etc.
-    text = re.sub(r'^(?:text|title|sub_title|figure_title|table)\[\[.*?\]\]\n', '', text, flags=re.MULTILINE)
+    # This regex removes only the marker part, not the entire line.
+    text = re.sub(
+        r'(?m)^(text|title|sub_title|figure_title|table)\[\[.*?\]\]\s*',
+        '',
+        text
+    )
+
     return text.strip()
 
 
@@ -126,6 +148,7 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
             - text: Extracted plain text from all pages.
             - pages: Number of pages processed.
             - language_detected: Detected or specified language.
+            - errors: List of per-page error messages (if any).
     """
     from PIL import Image as PILImage
 
@@ -145,8 +168,12 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     )
 
     page_texts = []
+    errors = []
+
     for i, img_bytes in enumerate(images):
         img = PILImage.open(BytesIO(img_bytes))
+        # Use unique output path per page to avoid overwriting
+        output_path = f"/tmp/ocr_out_{i}"
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             img.save(tmp.name)
             img_path = tmp.name
@@ -155,24 +182,35 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
                 tokenizer,
                 prompt=prompt,
                 image_file=img_path,
-                output_path="/tmp/ocr_out",
+                output_path=output_path,
                 base_size=1024,
                 image_size=768,
                 crop_mode=True,
-                save_results=True,
+                save_results=False,
                 eval_mode=True,
             )
             if result:
                 clean = strip_ocr_markers(result)
                 page_texts.append(clean)
-            print(f"Page {i+1}/{len(images)} done")
+            else:
+                page_texts.append("")
+                errors.append(f"Page {i+1}: model returned empty result")
+            logger.info("Page %d/%d done", i + 1, len(images))
+        except Exception as e:
+            logger.error("Page %d/%d failed: %s", i + 1, len(images), str(e))
+            page_texts.append("")
+            errors.append(f"Page {i+1}: {str(e)}")
         finally:
-            os.unlink(img_path)
+            try:
+                os.unlink(img_path)
+            except OSError:
+                pass
 
     return {
         "text": "\n\n".join(page_texts),
         "pages": len(images),
         "language_detected": language if language != "auto" else "auto-detected",
+        "errors": errors if errors else None,
     }
 
 
@@ -196,10 +234,9 @@ def web_ocr(body: dict) -> dict:
             - text: Extracted plain text.
             - pages: Number of pages.
             - language_detected: Detected or specified language.
+            - errors: List of per-page errors (if any).
         Or dict with "error" key on failure.
     """
-    import traceback
-
     pdf_b64 = body.get("pdf_data", "")
     language = body.get("language", "auto")
 
