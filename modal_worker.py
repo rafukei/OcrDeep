@@ -2,7 +2,7 @@
 Modal worker for PDF OCR using DeepSeek-OCR-2 model from HuggingFace.
 Runs entirely on Modal GPU — no external API calls.
 
-Key insight: model.infer(eval_mode=True) returns text directly.
+Model is cached at module level (one load per container) and reused for all pages.
 """
 import base64, re
 from io import BytesIO
@@ -34,11 +34,33 @@ modal_image = (
         "torchvision>=0.15.0",
         "fastapi[standard]>=0.110.0",
     )
-    .env({"FORCE_REBUILD": "15"})
+    .env({"FORCE_REBUILD": "17"})
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Global model cache — loaded once per container, shared across all calls
+# ─────────────────────────────────────────────────────────────────────────────
 _cached_model = None
 _cached_tokenizer = None
+
+
+def _get_model():
+    """Load model + tokenizer once; subsequent calls return cached instances."""
+    global _cached_model, _cached_tokenizer
+    if _cached_model is None:
+        from transformers import AutoModel, AutoTokenizer
+        print(f"Loading model {MODEL_NAME}...")
+        _cached_tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_NAME, trust_remote_code=True
+        )
+        _cached_model = AutoModel.from_pretrained(
+            MODEL_NAME,
+            trust_remote_code=True,
+            use_safetensors=True,
+        )
+        _cached_model = _cached_model.eval().cuda()
+        print("Model loaded on GPU.")
+    return _cached_model, _cached_tokenizer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,33 +87,9 @@ def pdf_bytes_to_images(pdf_bytes: bytes) -> list[bytes]:
     return result
 
 
-def get_model():
-    """
-    Load and cache model and tokenizer.
-
-    Returns:
-        Tuple of (model, tokenizer). Loaded once per container lifetime.
-    """
-    global _cached_model, _cached_tokenizer
-    if _cached_model is None:
-        import torch
-        from transformers import AutoModel, AutoTokenizer
-        _cached_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        _cached_model = AutoModel.from_pretrained(
-            MODEL_NAME,
-            trust_remote_code=True,
-            use_safetensors=True,
-        )
-        _cached_model = _cached_model.eval().cuda()
-    return _cached_model, _cached_tokenizer
-
-
 def strip_ocr_markers(text: str) -> str:
     """
     Remove DeepSeek-OCR-2 output markers from text.
-
-    DeepSeek-OCR-2 emits <|ref|>...<|/ref|> and <|det|>...<|/det|> markers.
-    This function strips them to return clean plain text.
 
     Args:
         text: Raw model output string.
@@ -99,19 +97,25 @@ def strip_ocr_markers(text: str) -> str:
     Returns:
         Cleaned text with markers removed.
     """
-    text = re.sub(r'<\|ref\|>(.*?)<\|/ref\|>', r'\1', text)
-    text = re.sub(r'<\|det\|>(.*?)<\|/det\|>', r'\1', text)
+    # Remove block-level markers (ref/det spans)
+    text = re.sub(r'<\|ref\|>(.*?)<\|/ref\|>', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'<\|det\|>(.*?)<\|/det\|>', r'\1', text, flags=re.DOTALL)
+    # Remove per-line bbox markers: text[[x,y,w,h]], title[[...]], etc.
+    text = re.sub(r'^(?:text|title|sub_title|figure_title|table)\[\[.*?\]\]\n', '', text, flags=re.MULTILINE)
     return text.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Modal GPU functions
+# Modal GPU function — model reused across pages within same container call
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.function(image=modal_image, gpu="a10g", timeout=600)
+@app.function(image=modal_image, gpu="A100", timeout=900)
 def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     """
     Core OCR function — runs on Modal GPU.
+
+    The model is loaded once when first called in a container, then reused
+    for all subsequent pages within the same function call (same container).
 
     Args:
         pdf_bytes: Raw PDF file bytes.
@@ -132,7 +136,7 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     if not images:
         raise ValueError("PDF has no pages")
 
-    model, tokenizer = get_model()
+    model, tokenizer = _get_model()
 
     prompt = (
         "<image>\n<|grounding|>Convert the document to markdown."
@@ -141,7 +145,7 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     )
 
     page_texts = []
-    for img_bytes in images:
+    for i, img_bytes in enumerate(images):
         img = PILImage.open(BytesIO(img_bytes))
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             img.save(tmp.name)
@@ -161,6 +165,7 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
             if result:
                 clean = strip_ocr_markers(result)
                 page_texts.append(clean)
+            print(f"Page {i+1}/{len(images)} done")
         finally:
             os.unlink(img_path)
 
@@ -171,7 +176,11 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     }
 
 
-@app.function(image=modal_image, timeout=600)
+# ─────────────────────────────────────────────────────────────────────────────
+# Web endpoint (stateless FastAPI wrapper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.function(image=modal_image, timeout=900)
 @fastapi_endpoint(method="POST")
 def web_ocr(body: dict) -> dict:
     """
@@ -206,6 +215,8 @@ def web_ocr(body: dict) -> dict:
         return {"error": "Data is not a valid PDF"}
 
     try:
+        # ocr_pdf.remote() keeps the container alive between page iterations,
+        # reusing the same model instance loaded by _get_model()
         result = ocr_pdf.remote(pdf_bytes, language=language)
         return result
     except Exception as e:
