@@ -2,7 +2,7 @@
 Modal worker for PDF OCR using DeepSeek-OCR-2 model from HuggingFace.
 Runs entirely on Modal GPU — no external API calls.
 
-Key insight from source code: model.infer(eval_mode=True) returns text directly.
+Key insight: model.infer(eval_mode=True) returns text directly.
 """
 import base64, re
 from io import BytesIO
@@ -11,10 +11,7 @@ import tempfile, os
 import modal
 from modal import App, Image as ModalImage, fastapi_endpoint
 
-# Modal app name
 app = App("modal-ocr-mcp")
-
-# HuggingFace model
 MODEL_NAME = "deepseek-ai/DeepSeek-OCR-2"
 
 # Base image with GPU support and all dependencies
@@ -40,13 +37,24 @@ modal_image = (
     .env({"FORCE_REBUILD": "15"})
 )
 
-# Global model/tokenizer cache
 _cached_model = None
 _cached_tokenizer = None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 def pdf_bytes_to_images(pdf_bytes: bytes) -> list[bytes]:
-    """Convert PDF bytes to PNG image bytes (one per page)."""
+    """
+    Convert PDF bytes to PNG image bytes (one per page).
+
+    Args:
+        pdf_bytes: Raw PDF file bytes.
+
+    Returns:
+        List of PNG image bytes, one per page.
+    """
     from pdf2image import convert_from_bytes
     images = convert_from_bytes(pdf_bytes, fmt="png", dpi=150)
     result = []
@@ -58,12 +66,16 @@ def pdf_bytes_to_images(pdf_bytes: bytes) -> list[bytes]:
 
 
 def get_model():
-    """Load and cache model+tokenizer (called once per container)."""
+    """
+    Load and cache model and tokenizer.
+
+    Returns:
+        Tuple of (model, tokenizer). Loaded once per container lifetime.
+    """
     global _cached_model, _cached_tokenizer
     if _cached_model is None:
         import torch
         from transformers import AutoModel, AutoTokenizer
-
         _cached_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
         _cached_model = AutoModel.from_pretrained(
             MODEL_NAME,
@@ -71,27 +83,45 @@ def get_model():
             use_safetensors=True,
         )
         _cached_model = _cached_model.eval().cuda()
-
     return _cached_model, _cached_tokenizer
 
 
 def strip_ocr_markers(text: str) -> str:
     """
-    DeepSeek-OCR-2 outputs text with <|ref|>...<|/ref|> and <|det|>...<|/det|> markers.
-    Extract clean text by stripping these markers.
+    Remove DeepSeek-OCR-2 output markers from text.
+
+    DeepSeek-OCR-2 emits <|ref|>...<|/ref|> and <|det|>...<|/det|> markers.
+    This function strips them to return clean plain text.
+
+    Args:
+        text: Raw model output string.
+
+    Returns:
+        Cleaned text with markers removed.
     """
-    # Remove <|ref|>text content<|/ref|> pairs
     text = re.sub(r'<\|ref\|>(.*?)<\|/ref\|>', r'\1', text)
-    # Remove <|det|>bbox coordinates<|/det|> pairs
     text = re.sub(r'<\|det\|>(.*?)<\|/det\|>', r'\1', text)
     return text.strip()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Modal GPU functions
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.function(image=modal_image, gpu="a10g", timeout=600)
 def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     """
     Core OCR function — runs on Modal GPU.
-    Uses model.infer(eval_mode=True) which returns text directly.
+
+    Args:
+        pdf_bytes: Raw PDF file bytes.
+        language: Target language or "auto" (default: "auto").
+
+    Returns:
+        Dict with keys:
+            - text: Extracted plain text from all pages.
+            - pages: Number of pages processed.
+            - language_detected: Detected or specified language.
     """
     from PIL import Image as PILImage
 
@@ -104,19 +134,18 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
 
     model, tokenizer = get_model()
 
-    if language == "auto":
-        prompt = "<image>\n<|grounding|>Convert the document to markdown."
-    else:
-        prompt = f"<image>\n<|grounding|>Convert the document to markdown in {language}."
+    prompt = (
+        "<image>\n<|grounding|>Convert the document to markdown."
+        if language == "auto"
+        else f"<image>\n<|grounding|>Convert the document to markdown in {language}."
+    )
 
     page_texts = []
     for img_bytes in images:
         img = PILImage.open(BytesIO(img_bytes))
-
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             img.save(tmp.name)
             img_path = tmp.name
-
         try:
             result = model.infer(
                 tokenizer,
@@ -146,9 +175,19 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
 @fastapi_endpoint(method="POST")
 def web_ocr(body: dict) -> dict:
     """
-    Web endpoint for FastAPI to call.
-    Accepts JSON: {"pdf_data": "base64...", "language": "auto"}
-    Returns:      {"text": "...", "pages": N, "language_detected": "..."}
+    FastAPI web endpoint — receives JSON, calls ocr_pdf on GPU, returns result.
+
+    Args:
+        body: JSON with keys:
+            - pdf_data (str): Base64-encoded PDF bytes.
+            - language (str, optional): Target language or "auto".
+
+    Returns:
+        Dict with keys:
+            - text: Extracted plain text.
+            - pages: Number of pages.
+            - language_detected: Detected or specified language.
+        Or dict with "error" key on failure.
     """
     import traceback
 
