@@ -1,13 +1,13 @@
-# Modal OCR MCP Service
+# Modal OCR Service
 
-Docker-based OCR service with MCP interface — converts PDFs to text using **DeepSeek-OCR-v2** model running entirely on **Modal GPU** (no external API calls).
+Docker-based OCR service — converts PDFs to text using **DeepSeek-OCR-v2** model running on **Modal GPU** via REST API.
 
 ## Architecture
 
 ```
-MCP Request (stdio) → Docker Container → Modal GPU → deepseek-ai/deepseek-ocr-v2
-                                             ↓
-                                    Extracted text → MCP Response
+HTTP Request → Docker Container → Modal GPU → deepseek-ai/deepseek-ocr-v2
+                                              ↓
+                                     Extracted text → JSON Response
 ```
 
 ## Quick Start
@@ -15,19 +15,20 @@ MCP Request (stdio) → Docker Container → Modal GPU → deepseek-ai/deepseek-
 ### Build
 
 ```bash
-docker build -t modal-ocr-mcp:latest /tmp/modal-ocr-mcp
+docker build -t modal-ocr-api ~/DockerShared
 ```
 
 ### Run
 
 ```bash
 docker run --rm \
-  -e MODAL_TOKEN_ID=<your_modal_token_id> \
-  -e MODAL_TOKEN_SECRET=<your_modal_token_secret> \
-  modal-ocr-mcp
+  -p 7000:8000 \
+  -e MODAL_TOKEN_ID=<your_token_id> \
+  -e MODAL_TOKEN_SECRET=<your_token_secret> \
+  modal-ocr-api
 ```
 
-The container starts an MCP stdio server. Connect to it using any MCP client (Hermès Agent, Claude Desktop, etc.).
+The container exposes a FastAPI REST server on port 8000 (mapped to host 7000).
 
 ## Get Modal Credentials
 
@@ -35,13 +36,13 @@ The container starts an MCP stdio server. Connect to it using any MCP client (He
 2. Go to Settings → Tokens
 3. Create a new token and copy the token ID and secret
 
-## MCP Tools
+## API Endpoints
 
-### `pdf_to_text`
+### `POST /ocr`
 
 Convert a PDF document to plain text using DeepSeek-OCR-v2 running on Modal GPU.
 
-**Input:**
+**Request (JSON):**
 ```json
 {
   "pdf_data": "<base64-encoded PDF bytes>",
@@ -49,7 +50,7 @@ Convert a PDF document to plain text using DeepSeek-OCR-v2 running on Modal GPU.
 }
 ```
 
-**Output:**
+**Response:**
 ```json
 {
   "text": "Extracted text content...",
@@ -58,38 +59,48 @@ Convert a PDF document to plain text using DeepSeek-OCR-v2 running on Modal GPU.
 }
 ```
 
-### `health`
+### `POST /ocr/file` (multipart)
+
+Upload a PDF file directly for OCR processing.
+
+**Request:** `multipart/form-data` with a `file` field containing the PDF.
+
+**Response:** Same as `/ocr`.
+
+### `GET /health`
 
 Health check.
 
-**Output:** `{"status": "ok", "service": "modal-ocr-mcp"}`
+**Response:** `{"status": "ok", "service": "modal-ocr-api"}`
 
-## Hermès Agent Integration
-
-Add this to your `~/.hermes/config.yaml`:
-
-```yaml
-mcp_servers:
-  modal-ocr:
-    command: "docker"
-    args: ["run", "--rm", "-i",
-           "-e", "MODAL_TOKEN_ID=<your_token_id>",
-           "-e", "MODAL_TOKEN_SECRET=<your_token_secret>",
-           "modal-ocr-mcp"]
-```
-
-Restart Hermès Agent and the `pdf_to_text` tool will be available.
-
-## Health Check (Quick Test)
+## Example Usage
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' > /tmp/mcp_in
-echo '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"health","arguments":{}}}' >> /tmp/mcp_in
-docker run --rm -i \
-  -e MODAL_TOKEN_ID=<your_token_id> \
-  -e MODAL_TOKEN_SECRET=<your_token_secret> \
-  modal-ocr-mcp < /tmp/mcp_in
+# With JSON body
+curl -X POST http://localhost:7000/ocr \
+  -H "Content-Type: application/json" \
+  -d '{"pdf_data": "'"$(base64 -w0 document.pdf)"'", "language": "auto"}'
+
+# With file upload
+curl -X POST http://localhost:7000/ocr/file \
+  -F "file=@document.pdf"
+
+# Health check
+curl http://localhost:7000/health
 ```
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `MODAL_TOKEN_ID` | Yes | Modal token ID (modal.com → Settings → Tokens) |
+| `MODAL_TOKEN_SECRET` | Yes | Modal token secret |
+
+## Container Ports
+
+| Host | Container | Description |
+|------|-----------|-------------|
+| 7000 | 8000 | FastAPI REST server |
 
 ## Troubleshooting
 
@@ -100,14 +111,8 @@ Ensure `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` are set correctly.
 Run with `-it` to see error output:
 ```bash
 docker run -it --rm \
+  -p 7000:8000 \
   -e MODAL_TOKEN_ID=<your_token_id> \
   -e MODAL_TOKEN_SECRET=<your_token_secret> \
-  modal-ocr-mcp
+  modal-ocr-api
 ```
-
-## Environment Variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `MODAL_TOKEN_ID` | Yes | Modal token ID (modal.com → Settings → Tokens) |
-| `MODAL_TOKEN_SECRET` | Yes | Modal token secret |
