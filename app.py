@@ -1,6 +1,6 @@
 """
 FastAPI server for Docker-based OCR service using Modal + DeepSeek-OCR-2.
-Receives PDF via HTTP, forwards to Modal GPU endpoint, returns extracted text.
+Receives PDF or image via HTTP, forwards to Modal GPU endpoint, returns extracted text.
 
 Architecture:
   Client → FastAPI (Docker) → Modal Web Endpoint (GPU) → DeepSeek-OCR-2
@@ -23,6 +23,9 @@ MODAL_ENDPOINT = os.environ.get(
     "https://raafael-keikko--modal-ocr-mcp-web-ocr.modal.run"
 )
 
+# Supported image MIME types
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response models
@@ -40,13 +43,25 @@ class OCRRequest(BaseModel):
     language: str = "auto"
 
 
+class ImageOCRRequest(BaseModel):
+    """
+    JSON request body for /ocr/image/json endpoint.
+
+    Attributes:
+        image_data: Base64-encoded image bytes (PNG, JPEG, WebP).
+        language: Target language or "auto" (default: "auto").
+    """
+    image_data: str
+    language: str = "auto"
+
+
 class OCRResponse(BaseModel):
     """
     JSON response from OCR endpoints.
 
     Attributes:
-        text: Extracted plain text from all pages.
-        pages: Number of pages processed.
+        text: Extracted plain text.
+        pages: Number of pages processed (1 for images).
         language_detected: Detected or specified language.
     """
     text: str
@@ -69,8 +84,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Docker OCR Service",
-    description="PDF OCR via Modal + DeepSeek-OCR-2",
-    version="1.0.0",
+    description="PDF & Image OCR via Modal + DeepSeek-OCR-2",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -110,7 +125,6 @@ def ocr_pdf(file: UploadFile = File(...)):
     Example:
         curl -X POST http://localhost:7000/ocr -F "file=@document.pdf"
     """
-    # Validate file presence and type
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "File must be a PDF")
 
@@ -118,14 +132,11 @@ def ocr_pdf(file: UploadFile = File(...)):
     if len(pdf_bytes) == 0:
         raise HTTPException(400, "Empty file")
 
-    # Validate PDF magic bytes
     if pdf_bytes[:4] != b"%PDF":
         raise HTTPException(400, "Not a valid PDF file")
 
-    # Encode to base64 for Modal
     pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
 
-    # Forward to Modal GPU endpoint
     try:
         resp = requests.post(
             MODAL_ENDPOINT,
@@ -169,8 +180,8 @@ def ocr_pdf_json(body: OCRRequest):
         HTTPException 504: Modal OCR timed out (>5 min).
 
     Example:
-        curl -X POST http://localhost:7000/ocr/json \\
-          -H "Content-Type: application/json" \\
+        curl -X POST http://localhost:7000/ocr/json \
+          -H "Content-Type: application/json" \
           -d '{"pdf_data": "...base64...", "language": "auto"}'
     """
     pdf_bytes = base64.b64decode(body.pdf_data)
@@ -202,6 +213,128 @@ def ocr_pdf_json(body: OCRRequest):
     return OCRResponse(
         text=result.get("text", ""),
         pages=result.get("pages", 0),
+        language_detected=result.get("language_detected", "unknown"),
+    )
+
+
+@app.post("/ocr/image", response_model=OCRResponse)
+def ocr_image(file: UploadFile = File(...)):
+    """
+    Upload an image file and get extracted text (multipart/form-data).
+
+    Supports PNG, JPEG, WebP.
+
+    Args:
+        file: Image file sent as multipart form field named "file".
+
+    Returns:
+        OCRResponse with extracted text, page count (always 1), and detected language.
+
+    Raises:
+        HTTPException 400: File is empty or not a supported image type.
+        HTTPException 502: Modal endpoint returned an error.
+        HTTPException 503: Cannot reach Modal endpoint.
+        HTTPException 504: Modal OCR timed out.
+
+    Example:
+        curl -X POST http://localhost:7000/ocr/image -F "file=@photo.png"
+    """
+    content_type = file.content_type or "application/octet-stream"
+    if content_type not in IMAGE_TYPES:
+        raise HTTPException(
+            400,
+            f"Unsupported image type '{content_type}'. Supported: PNG, JPEG, WebP."
+        )
+
+    img_bytes = file.file.read()
+    if len(img_bytes) == 0:
+        raise HTTPException(400, "Empty file")
+
+    img_b64 = base64.b64encode(img_bytes).decode("ascii")
+
+    try:
+        resp = requests.post(
+            MODAL_ENDPOINT,
+            json={"image_data": img_b64, "language": "auto"},
+            timeout=300,
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(504, "Modal OCR timed out (>5min)")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(503, "Cannot reach Modal endpoint")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Modal returned {resp.status_code}: {resp.text[:500]}")
+
+    result = resp.json()
+    if "error" in result:
+        raise HTTPException(500, f"OCR error: {result['error']}")
+
+    return OCRResponse(
+        text=result.get("text", ""),
+        pages=result.get("pages", 1),
+        language_detected=result.get("language_detected", "unknown"),
+    )
+
+
+@app.post("/ocr/image/json", response_model=OCRResponse)
+def ocr_image_json(body: ImageOCRRequest):
+    """
+    POST base64-encoded image directly as JSON and get extracted text.
+
+    Supports PNG, JPEG, WebP.
+
+    Args:
+        body: ImageOCRRequest with base64-encoded image and optional language.
+
+    Returns:
+        OCRResponse with extracted text, page count (always 1), and detected language.
+
+    Raises:
+        HTTPException 400: Image data is empty or invalid.
+        HTTPException 502: Modal endpoint returned an error.
+        HTTPException 503: Cannot reach Modal endpoint.
+        HTTPException 504: Modal OCR timed out.
+
+    Example:
+        curl -X POST http://localhost:7000/ocr/image/json \
+          -H "Content-Type: application/json" \
+          -d '{"image_data": "...base64...", "language": "auto"}'
+    """
+    img_bytes = base64.b64decode(body.image_data)
+
+    if len(img_bytes) == 0:
+        raise HTTPException(400, "Empty image data")
+
+    # Validate image magic bytes
+    if not (
+        img_bytes[:8] == b'\x89PNG\r\n\x1a\n' or  # PNG
+        img_bytes[:2] == b'\xff\xd8' or            # JPEG
+        img_bytes[:4] == b'RIFF' and img_bytes[8:12] == b'WEBP'  # WebP
+    ):
+        raise HTTPException(400, "Not a valid PNG, JPEG, or WebP image")
+
+    try:
+        resp = requests.post(
+            MODAL_ENDPOINT,
+            json={"image_data": body.image_data, "language": body.language},
+            timeout=300,
+        )
+    except requests.exceptions.Timeout:
+        raise HTTPException(504, "Modal OCR timed out (>5min)")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(503, "Cannot reach Modal endpoint")
+
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Modal returned {resp.status_code}")
+
+    result = resp.json()
+    if "error" in result:
+        raise HTTPException(500, f"OCR error: {result['error']}")
+
+    return OCRResponse(
+        text=result.get("text", ""),
+        pages=result.get("pages", 1),
         language_detected=result.get("language_detected", "unknown"),
     )
 

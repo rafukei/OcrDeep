@@ -42,7 +42,7 @@ modal_image = (
         "torchvision>=0.15.0",
         "fastapi[standard]>=0.110.0",
     )
-    .env({"FORCE_REBUILD": "18"})
+    .env({"FORCE_REBUILD": "19"})
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,47 +214,135 @@ def ocr_pdf(pdf_bytes: bytes, language: str = "auto") -> dict:
     }
 
 
+@app.function(image=modal_image, gpu="A100", timeout=900)
+def ocr_image(image_b64: str, language: str = "auto") -> dict:
+    """
+    OCR a single image — runs on Modal GPU.
+
+    The model is loaded once when first called in a container, then reused
+    for subsequent calls within the same container.
+
+    Args:
+        image_b64: Base64-encoded image bytes (PNG, JPEG, WebP).
+        language: Target language or "auto" (default: "auto").
+
+    Returns:
+        Dict with keys:
+            - text: Extracted plain text.
+            - pages: Always 1 for images.
+            - language_detected: Detected or specified language.
+            - errors: List of per-page error messages (if any).
+    """
+    from PIL import Image as PILImage
+
+    if not image_b64:
+        raise ValueError("No image data provided")
+
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        raise ValueError(f"Invalid base64: {e}")
+
+    img = PILImage.open(BytesIO(image_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        img.save(tmp.name)
+        img_path = tmp.name
+
+    model, tokenizer = _get_model()
+
+    prompt = (
+        "<image>\n<|grounding|>Convert the document to markdown."
+        if language == "auto"
+        else f"<image>\n<|grounding|>Convert the document to markdown in {language}."
+    )
+
+    try:
+        result = model.infer(
+            tokenizer,
+            prompt=prompt,
+            image_file=img_path,
+            output_path="/tmp/ocr_out_img",
+            base_size=1024,
+            image_size=768,
+            crop_mode=True,
+            save_results=False,
+            eval_mode=True,
+        )
+        if result:
+            text = strip_ocr_markers(result)
+        else:
+            text = ""
+        logger.info("Image OCR done")
+        return {
+            "text": text,
+            "pages": 1,
+            "language_detected": language if language != "auto" else "auto-detected",
+            "errors": None,
+        }
+    except Exception as e:
+        logger.error("Image OCR failed: %s", str(e))
+        return {
+            "text": "",
+            "pages": 1,
+            "language_detected": language if language != "auto" else "auto-detected",
+            "errors": [str(e)],
+        }
+    finally:
+        try:
+            os.unlink(img_path)
+        except OSError:
+            pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Web endpoint (stateless FastAPI wrapper)
+# Web endpoint (stateless FastAPI wrapper — handles both PDF and image)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.function(image=modal_image, timeout=900)
 @fastapi_endpoint(method="POST")
 def web_ocr(body: dict) -> dict:
     """
-    FastAPI web endpoint — receives JSON, calls ocr_pdf on GPU, returns result.
+    FastAPI web endpoint — receives JSON, calls OCR on GPU, returns result.
 
-    Args:
-        body: JSON with keys:
-            - pdf_data (str): Base64-encoded PDF bytes.
-            - language (str, optional): Target language or "auto".
+    Handles both PDF and image inputs:
+        - pdf_data (str): Base64-encoded PDF bytes.
+        - image_data (str): Base64-encoded image bytes (PNG, JPEG, WebP).
+        - language (str, optional): Target language or "auto".
 
     Returns:
         Dict with keys:
             - text: Extracted plain text.
-            - pages: Number of pages.
+            - pages: Number of pages (1 for images).
             - language_detected: Detected or specified language.
             - errors: List of per-page errors (if any).
         Or dict with "error" key on failure.
     """
     pdf_b64 = body.get("pdf_data", "")
+    image_b64 = body.get("image_data", "")
     language = body.get("language", "auto")
 
-    if not pdf_b64:
-        return {"error": "pdf_data is required"}
+    if pdf_b64:
+        try:
+            pdf_bytes = base64.b64decode(pdf_b64)
+        except Exception as e:
+            return {"error": f"Invalid base64: {e}"}
+        if pdf_bytes[:4] != b"%PDF":
+            return {"error": "Data is not a valid PDF"}
+        try:
+            result = ocr_pdf.remote(pdf_bytes, language=language)
+            return result
+        except Exception as e:
+            return {"error": f"OCR failed: {e}\n{traceback.format_exc()}"}
 
-    try:
-        pdf_bytes = base64.b64decode(pdf_b64)
-    except Exception as e:
-        return {"error": f"Invalid base64: {e}"}
+    elif image_b64:
+        try:
+            result = ocr_image.remote(image_b64, language=language)
+            return result
+        except Exception as e:
+            return {"error": f"Image OCR failed: {e}\n{traceback.format_exc()}"}
 
-    if pdf_bytes[:4] != b"%PDF":
-        return {"error": "Data is not a valid PDF"}
-
-    try:
-        # ocr_pdf.remote() keeps the container alive between page iterations,
-        # reusing the same model instance loaded by _get_model()
-        result = ocr_pdf.remote(pdf_bytes, language=language)
-        return result
-    except Exception as e:
-        return {"error": f"OCR failed: {e}\n{traceback.format_exc()}"}
+    else:
+        return {"error": "Either pdf_data or image_data is required"}
